@@ -46,7 +46,7 @@ from slice_replay import slice_unchanged
 from fork_check import check_run, verification_catalog
 from import_state import PatchState, narrow, settled_consumers
 from mn_reduced import refine_max_nodes
-from inert_files import inert_change, safe_headers
+from inert_files import inert_change, metadata_only, safe_headers
 
 
 def candidates(change, cov, catalog, *, fixtures_only=False, state=None, tests_by_file=None):
@@ -116,12 +116,17 @@ def main():
     for patch in patches:
         try:
             text = patch.read_text(encoding="utf-8")
+            if metadata_only(text):
+
+                print(json.dumps({"commit": patch.stem, "workers": []}, separators=(",", ":")))
+                continue
             changes = read_changes(text, source)
             if slice_unchanged(changes, text, cov, catalog):
                 print(json.dumps({"commit": patch.stem, "workers": []}, separators=(",", ":")))
                 continue
-            documented = all(not c.structural and c.path.endswith(".py")
-                             and docstrings_only(c.path, c.original, c.patched) for c in changes)
+            documented = safe_headers(text) and all(
+                not c.structural and c.path.endswith(".py")
+                and docstrings_only(c.path, c.original, c.patched, c.removed, c.added) for c in changes)
             state = None if documented else PatchState(changes, source, verify_until, seconds)
             proof_context = changes if time.monotonic() < verify_until else None
             ordered = not documented and any(
@@ -130,7 +135,7 @@ def main():
                 chosen = set(catalog)
             elif documented:
 
-                chosen = set()
+                chosen = set(cov.missing)
                 for change in changes:
                     chosen.update(cov.fixture(change.path))
             elif all(inert_change(c, cov) for c in changes) and safe_headers(text):

@@ -33,12 +33,21 @@ def read_changes(diff: str, root: Path) -> list[Change]:
     lines = diff.replace("\r\n", "\n").split("\n")
     result = []
     i = 0
+
+
+    bare = False
     while i < len(lines):
         if not lines[i].startswith("--- "):
             if lines[i].startswith(("GIT binary patch", "Binary files ", "rename from ", "copy from ")):
                 raise ValueError("non-text change")
+            if lines[i].startswith("diff --git "):
+                if bare:
+                    raise ValueError("file added or deleted without content")
+            elif lines[i].startswith(("new file mode ", "deleted file mode ")):
+                bare = True
             i += 1
             continue
+        bare = False
         before = _path(lines[i], "a/")
         after = _path(lines[i + 1], "b/")
         if not lines[i + 1].startswith("+++ ") or (before is None and after is None):
@@ -98,6 +107,8 @@ def read_changes(diff: str, root: Path) -> list[Change]:
         new.extend(source[cursor:])
         change.patched = "\n".join(new) + ("\n" if new and ends_in_newline else "")
         result.append(change)
+    if bare:
+        raise ValueError("file added or deleted without content")
     if not result:
         raise ValueError("no text hunks")
     return result

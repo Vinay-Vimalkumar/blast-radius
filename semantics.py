@@ -835,7 +835,22 @@ def _same_statement(a, b):
     return True
 
 
-def docstrings_only(path: str, original: str, patched: str) -> bool:
+def _within_docstrings(tree, source, lines):
+    """Every given line that holds code lies in the docstring of the module or of a class or function."""
+    rows = source.split("\n")
+    pending = {line for line in lines if 0 < line <= len(rows) and rows[line - 1].strip()
+               and not rows[line - 1].lstrip().startswith("#")}
+    scopes = [tree]
+    while scopes and pending:
+        body = scopes.pop().body
+        if body and _docstring(body[0]):
+            pending.difference_update(range(body[0].lineno, body[0].end_lineno + 1))
+        scopes.extend(statement for statement in body if isinstance(statement, _DEFINITIONS)
+                      and any(statement.lineno <= line <= statement.end_lineno for line in pending))
+    return not pending
+
+
+def docstrings_only(path: str, original: str, patched: str, removed=None, added=None) -> bool:
     """True if the change is confined to docstrings: the compiled programs differ, yet the two sources are the
     same program once the docstring of the module and of every class and function is taken out. They can then
     differ only in __doc__ values, comments and layout.
@@ -847,7 +862,14 @@ def docstrings_only(path: str, original: str, patched: str) -> bool:
     if _changed_lines(path, original, patched) is not None:
         return False
     try:
-        return _same_bodies(_baseline(path, original)[0].body, patched_tree(path, patched).body)
+
+        old = _baseline(path, original)[0]
+        if removed is not None and not _within_docstrings(old, original, removed):
+            return False
+        new = patched_tree(path, patched)
+        if added is not None and not _within_docstrings(new, patched, added):
+            return False
+        return _same_bodies(old.body, new.body)
     except (SyntaxError, ValueError, RecursionError):
         return False
 
