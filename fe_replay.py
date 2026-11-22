@@ -59,11 +59,12 @@ def _line_index():
     data = _load("fe_lines.json.gz")
     if data["tree"] != _load("fe_baseline.json.gz")["tree"]:
         raise ValueError("line index and baseline come from different trees")
-    return {path: frozenset(lines) for path, lines in data["parent"].items()}, data["worker"], data["queries"]
+    return ({path: frozenset(lines) for path, lines in data["parent"].items()}, data["worker"], data["queries"],
+            data["plan"])
 
 
 def _plan(changed):
-    parent_lines, worker_lines, count = _line_index()
+    parent_lines, worker_lines, count, _ = _line_index()
     parent = any(not lines.isdisjoint(parent_lines.get(path, ())) for path, lines in changed.items())
     mask = 0
     for path, lines in changed.items():
@@ -74,6 +75,21 @@ def _plan(changed):
     if not parent and not worker:
         return True, list(range(count))
     return parent, worker
+
+
+def _planned(changed, worker):
+    """The replayed queries that must also build their plan: those whose rendering or plan construction runs a
+    changed line. A change that no recorded step runs replays everything, plans included."""
+    _, worker_lines, _, plan_lines = _line_index()
+    mask = known = 0
+    for path, lines in changed.items():
+        table, seen = plan_lines.get(path, {}), worker_lines.get(path, {})
+        for line in lines:
+            mask |= int(table.get(str(line), "0"), 16)
+            known |= int(seen.get(str(line), "0"), 16)
+    if not known:
+        return list(worker)
+    return [index for index in worker if mask >> index & 1]
 
 
 @lru_cache(maxsize=1)
@@ -100,10 +116,12 @@ def _saving(chosen, catalog, full_cost):
     return (before - cost([node for node in nodes if node != DS])) / 1000
 
 
-def _expected_cpu(parent, worker):
-    per_query = _load("fe_baseline.json.gz")["worker_cpu"]
+def _expected_cpu(parent, worker, planned=()):
+    baseline = _load("fe_baseline.json.gz")
+    per_query, per_plan = baseline["worker_cpu"], baseline["plan_cpu"]
     return (0.5 + (2.6 if parent else 0.0) + (0.4 if worker else 0.0)
-            + sum(per_query.get(str(index), 0.01) + 0.01 for index in worker))
+            + sum(per_query.get(str(index), 0.01) + 0.01 for index in worker)
+            + sum(per_plan.get(str(index), 0.05) + 0.01 for index in planned))
 
 
 _FUNCTION = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
@@ -249,9 +267,10 @@ def refine_frontend(changes, chosen, cov, catalog, verify_until, full_cost=None)
         if isinstance(admitted, str) or not _environment():
             return chosen
         parent, worker = _plan(admitted[1])
-        if _saving(chosen, catalog, full_cost) < 1.5 * _expected_cpu(parent, worker) + 1.0:
+        planned = _planned(admitted[1], worker)
+        if _saving(chosen, catalog, full_cost) < 1.5 * _expected_cpu(parent, worker, planned) + 1.0:
             return chosen
-        verdict = _replay({"sources": admitted[0], "parent": parent, "worker": worker},
+        verdict = _replay({"sources": admitted[0], "parent": parent, "worker": worker, "plan": planned},
                           min(WALL_LIMIT, remaining - 1))
         return chosen - {DS} if verdict == "ok" else chosen
     except Exception:
@@ -572,11 +591,101 @@ def _loaded():
     return json.dumps([modules, dispatch])
 
 
-def worker_role(pairs, blobs, emit, stages, schema, final_state=True):
+def plan_digest(plan):
+    """Digest of what the executor can read from a plan, free of object addresses and of set order.
+
+    An expression held by the plan or by a step is named by the tree it hangs in and its place in that tree, and
+    every such tree is digested whole, parents and annotations included. A step is digested from its own fields
+    and, bottom-up, from its dependencies; each step is then paired with its dependents, and the plan carries its
+    root together with every step reachable through either kind of edge.
+    """
+    from sqlglot import exp
+    from sqlglot.planner import Step
+
+    trees, keep, merkle, active = {}, [], {}, set()
+
+    def text(value):
+        return json.dumps(value, separators=(",", ":"))
+
+    def cref(cls):
+        return f"{cls.__module__}.{cls.__qualname__}"
+
+    def place(node):
+        path, top = [], node
+        while top.parent is not None:
+            path.append([top.arg_key, top.index])
+            top = top.parent
+        path.reverse()
+        current = top
+        for key, index in path:
+            current = current.args.get(key) if isinstance(current, exp.Expr) else None
+            if index is not None and isinstance(current, list) and -len(current) <= index < len(current):
+                current = current[index]
+        if current is not node:
+            return ["loose", tree_digest(node)]
+        digest = trees.get(id(top))
+        if digest is None:
+            keep.append(top)
+            digest = trees[id(top)] = tree_digest(top)
+        return ["node", digest, path]
+
+    def show(value):
+        kind = type(value)
+        if value is None or kind is bool or kind is int or kind is str:
+            return value
+        if kind is float:
+            return ["float", repr(value)]
+        if isinstance(value, exp.Expr):
+            return place(value)
+        if isinstance(value, Step):
+            return ["step", step_digest(value)]
+        if kind is list or kind is tuple:
+            return ["L" if kind is list else "T", [show(item) for item in value]]
+        if kind is dict:
+            return ["D", [[show(key), show(item)] for key, item in value.items()]]
+        if kind is set or kind is frozenset:
+            return ["S", sorted(text(show(item)) for item in value)]
+        if isinstance(value, type):
+            return ["C", cref(value)]
+        return ["O", tree_digest(value)]
+
+    def step_digest(step):
+        digest = merkle.get(id(step))
+        if digest is None:
+            if id(step) in active:
+                raise ValueError("a plan step depends on itself")
+            active.add(id(step))
+            fields = [[name, show(value)] for name, value in sorted(vars(step).items())
+                      if name not in ("dependencies", "dependents")]
+            below = sorted(step_digest(dependency) for dependency in step.dependencies)
+            active.discard(id(step))
+            keep.append(step)
+            digest = merkle[id(step)] = _digest(text([cref(type(step)), fields, below]))
+        return digest
+
+    def linked(step):
+        return _digest(text([step_digest(step), sorted(step_digest(dependent) for dependent in step.dependents)]))
+
+    reached, pending = {}, [plan.root]
+    while pending:
+        step = pending.pop()
+        if id(step) not in reached:
+            reached[id(step)] = step
+            pending.extend(step.dependencies)
+            pending.extend(step.dependents)
+    fields = [[name, show(value)] for name, value in sorted(vars(plan).items()) if name not in ("root", "_dag")]
+    graph = sorted([linked(step), sorted(linked(dependency) for dependency in dependencies)]
+                   for step, dependencies in plan._dag.items())
+    return _digest(text([cref(type(plan)), fields, linked(plan.root),
+                         sorted(linked(step) for step in reached.values()), graph]))
+
+
+def worker_role(pairs, blobs, emit, stages, schema, final_state=True, planned=frozenset()):
     import pickle
 
     from sqlglot import find_tables
     from sqlglot.optimizer import optimize
+    from sqlglot.planner import Plan
     from sqlglot.schema import ensure_schema
 
     for index, blob in blobs:
@@ -596,6 +705,12 @@ def worker_role(pairs, blobs, emit, stages, schema, final_state=True):
         with stages("render", index):
             text = optimized.sql(pretty=True)
         emit(f"render{index}", text)
+        if index in planned:
+            with stages("plan", index):
+                plan = Plan(optimized)
+            with stages("plandigest", index):
+                state = plan_digest(plan)
+            emit(f"plan{index}", state)
         emit(f"schema{index}", json.dumps(schema, sort_keys=True, default=repr))
         emit(f"loaded{index}", _loaded())
     if final_state:
@@ -729,7 +844,7 @@ def _collect(pid, read):
 
 
 def run_roles(pairs, schema, order, duck, expected=None, stages_factory=Stages, final_state=True, work=None,
-              session=None):
+              session=None, planned=frozenset()):
     feed = set(order if work is None else work)
     stop = []
     previous = signal.signal(signal.SIGUSR1, lambda *_: stop.append(1))
@@ -757,7 +872,7 @@ def run_roles(pairs, schema, order, duck, expected=None, stages_factory=Stages, 
             stages, artifacts = stages_factory(), {}
             with os.fdopen(blob_r, "rb") as stream:
                 worker_role(pairs, _blobs(stream), _emitter(artifacts, expected and expected["worker"]),
-                            stages, schema, final_state)
+                            stages, schema, final_state, planned)
             return finished(stages, artifacts)
 
         children["worker"] = _forked(worker)
@@ -837,14 +952,16 @@ def _child_main(protocol):
             else:
                 order, duck = work, []
             late = baseline["session_modules"] if request.get("parent", True) else None
+            planned = frozenset(request.get("plan", ())).intersection(work, executed)
             verdict, parent, worker, reports = run_roles(pairs, schema, order, duck, expected=baseline, work=work,
-                                                         session=late)
+                                                         session=late, planned=planned)
             if verdict == "ok":
                 wanted = {f"blob{index}" for index in order}
                 if duck:
                     wanted.update(name for name in baseline["parent"] if name.startswith("duck"))
                 needed = {f"{kind}{index}" for index in set(work).intersection(executed)
                           for kind in ("tables", "optimized", "render", "schema", "loaded")}
+                needed.update(f"plan{index}" for index in planned)
                 if work:
                     needed.add("state")
                 if (parent.keys() != wanted or worker.keys() != needed
