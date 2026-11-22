@@ -883,22 +883,9 @@ def narrow(change, fallback, state, cov, catalog, tests_by_file):
                 return fallback
             readers = cov.lines(change.path, body) | import_consumers(change.path, body | change.removed, cov, catalog)
             return (readers | keep) & set(fallback)
-        changed = state.changed()
-        if changed is None:
-            return fallback
-        narrowed = set()
-        for path in changed:
-            readers = binding_readers(path, cov, catalog, tests_by_file)
-            if readers is None:
 
-                return fallback
-            narrowed |= readers
-        if len(state.changes) == 1:
-            from declarations import filter_registry_readers
-            narrowed = filter_registry_readers(change, changed, narrowed)
-        result = (narrowed | keep) & set(fallback)
 
-        return result
+        return fallback
     except Exception:
         return fallback
 
