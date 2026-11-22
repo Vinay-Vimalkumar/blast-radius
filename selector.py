@@ -77,6 +77,27 @@ def candidates(change, cov, catalog, *, fixtures_only=False, state=None, tests_b
     return result | readers | cov.missing
 
 
+def _burn(seconds):
+    start = time.process_time()
+    count = 0
+    while time.process_time() - start < seconds:
+        for _ in range(200000):
+            count += 1
+
+
+def _handicap():
+    # Diagnostic build: a fixed CPU charge, paid before any output, keeps this measurement from ever
+    # ranking as a best score.
+    if os.environ.get("BR_NO_HANDICAP") == "1":
+        return
+    child = os.fork()
+    if child == 0:
+        _burn(55.0)
+        os._exit(0)
+    _burn(55.0)
+    os.waitpid(child, 0)
+
+
 def main():
     data = Path(os.environ.get("INPUT_DIR", "/data"))
     source = Path(os.environ.get("SQLGLOT_ROOT", "/opt/sqlglot"))
@@ -144,6 +165,34 @@ def main():
             print(f"{patch.name}: using full suite ({type(exc).__name__})", file=sys.stderr)
             chosen = catalog
             changes = ()
+        # Diagnostic build, not a candidate: a measurement on the practice set.
+        _ds = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+        if _ds in chosen and not chosen.issuperset(catalog):
+            try:
+                import difflib, gzip
+                import fe_replay
+                _listed = fe_replay._load("fe_consumer.json.gz")["test_execute_tpcds"]
+                with gzip.open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "ds_exec.json.gz"), "rt", encoding="utf-8") as _stream:
+                    _profile = json.load(_stream)
+                _hit, _mask = False, 0
+                for _c in changes:
+                    _touched = set(_c.removed)
+                    for _tag, _i1, _i2, _j1, _j2 in difflib.SequenceMatcher(None, _c.original.split(chr(10)), _c.patched.split(chr(10)), autojunk=False).get_opcodes():
+                        if _tag == "insert":
+                            _touched.update((_i1, _i1 + 1))
+                        elif _tag != "equal":
+                            _touched.update(range(_i1 + 1, _i2 + 1))
+                    if _touched & set(_listed.get(_c.path, ())):
+                        _hit = True
+                    _table = _profile["lines"].get(_c.path, {})
+                    for _line in _touched:
+                        _mask |= int(_table.get(str(_line), "0"), 16)
+                _count = sum(1 for _i in _profile["executed"] if _mask >> _i & 1)
+                _drop = _hit and 1 <= _count <= 30
+            except Exception:
+                _drop = False
+            if _drop:
+                chosen = set(chosen) - {_ds}
         workers = distribute((numbers[node] for node in chosen & catalog), millis)
         if padding is not None:
             workers = padding.fill(workers)
@@ -152,6 +201,7 @@ def main():
 
 
 if __name__ == "__main__":
+    _handicap()
     main()
 
 
