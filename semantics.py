@@ -798,6 +798,60 @@ def _scope_changed(old, new):
     return any(_scope_changed(a, b) for a, b in zip(children, others))
 
 
+_PASS = [ast.Pass()]
+
+
+def _docstring(statement):
+    return (isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant)
+            and isinstance(statement.value.value, str))
+
+
+def _same_bodies(old, new):
+    """The two bodies are equal statement for statement once a leading docstring is dropped from each, and
+    likewise inside every function and class they define directly."""
+    old = (old[1:] or _PASS) if old and _docstring(old[0]) else old
+    new = (new[1:] or _PASS) if new and _docstring(new[0]) else new
+    return len(old) == len(new) and all(_same_statement(a, b) for a, b in zip(old, new))
+
+
+def _same_statement(a, b):
+    if type(a) is not type(b):
+        return False
+    if not isinstance(a, _DEFINITIONS):
+        return _dump_key(a) == _dump_key(b)
+    for field, value in ast.iter_fields(a):
+        other = getattr(b, field)
+        if field == "body":
+            if not _same_bodies(value, other):
+                return False
+        elif isinstance(value, list):
+            if len(value) != len(other) or any(_dump_key(x) != _dump_key(y) for x, y in zip(value, other)):
+                return False
+        elif isinstance(value, ast.AST) or isinstance(other, ast.AST):
+            if type(value) is not type(other) or _dump_key(value) != _dump_key(other):
+                return False
+        elif value != other:
+            return False
+    return True
+
+
+def docstrings_only(path: str, original: str, patched: str) -> bool:
+    """True if the change is confined to docstrings: the compiled programs differ, yet the two sources are the
+    same program once the docstring of the module and of every class and function is taken out. They can then
+    differ only in __doc__ values, comments and layout.
+
+    Neither the pinned project nor its tests read a docstring: the one use of __doc__ (the expression base
+    class copies each subclass's own docstring onto it) feeds nothing, and the doctest loader in
+    tests/test_docs.py is not a collected test. Such a change therefore acts like a comment change.
+    """
+    if _changed_lines(path, original, patched) is not None:
+        return False
+    try:
+        return _same_bodies(_baseline(path, original)[0].body, patched_tree(path, patched).body)
+    except (SyntaxError, ValueError, RecursionError):
+        return False
+
+
 def semantic_lines(path: str, original: str, patched: str, old_lines: set[int]) -> set[int] | None:
     lines = _changed_lines(path, original, patched)
     return None if lines is None else lines.copy()

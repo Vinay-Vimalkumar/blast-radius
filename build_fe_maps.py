@@ -4,10 +4,11 @@ usage (inside the image, on the pinned tree, PYTHONHASHSEED=0):
     python -B build_fe_maps.py <out-dir>      write fe_baseline, fe_lines and fe_consumer (.json.gz) to <out-dir>
     python -B build_fe_maps.py --validate     replay the pinned tree against the maps next to this file
 
-The maps this starts from (the three files next to this script) were recorded with the replay ending at the
-optimized tree and its rendering; their consumer lines are the lines four runs of the real test executed outside
-parse_one, transpile, find_tables, optimize and the pickling. fe_replay.worker_role can now also build the plan
-and digest it. This script
+The maps this starts from (the three files next to this script) were first recorded with the replay ending at
+the optimized tree and its rendering; their consumer lines are the lines four runs of the real test executed
+outside parse_one, transpile, find_tables, optimize and the pickling. fe_replay.worker_role can now also build the
+plan and digest it. This script can be run again on its own output: it sets aside the plan digests and the
+admitted lines an earlier run recorded. It
 
   1. re-records the replay's artifacts in a fresh process, checks that every artifact of the old baseline is
      reproduced, and adds plan<i> (the plan digest of every executed query) and plan_cpu;
@@ -22,8 +23,11 @@ and digest it. This script
   3. writes fe_lines with "plan": for each line the queries whose rendering or plan construction runs it (the
      replay builds the plan for those), and with these masks or-ed into the old worker masks, which are
      otherwise kept as they were;
-  4. writes fe_consumer without the lines that are not start-up lines and that the traces saw in no step other
-     than U, T, O, R and P. A line seen anywhere else (E, S, I, B, X, K or start-up) stays a consumer line.
+  4. writes fe_consumer without the lines that are not start-up lines, that the traces saw in no step other
+     than U, T, O, R and P, and that every query runs in R and P whether it is the first task of its process
+     or not. A line seen anywhere else (E, S, I, B, X, K or start-up) stays a consumer line. So does a line
+     that some query runs in R or P only as a first task: the replay handles its queries in one process, where
+     only the first of them is in that position.
 """
 import gzip
 import inspect
@@ -180,7 +184,8 @@ def startup(role, path):
 
 
 def trace_steps():
-    """{path: {line: {step: mask of queries}}} from the real execute() flow, cold and warm."""
+    """{path: {line: {step: [cold mask, warm mask]}}} from the real execute() flow: the queries that run the line
+    in that step as the first task of a fresh process, and after every other query in the same process."""
     from tests.helpers import TPCDS_SCHEMA, load_sql_fixture_pairs
     from tests.test_executor import TestExecutor
 
@@ -268,11 +273,11 @@ def trace_steps():
     masks = {}
     warm = forked(warm_all)
     for index in executed:
-        for found in (forked(lambda: traced(blobs[index])), warm[index]):
+        for slot, found in enumerate((forked(lambda: traced(blobs[index])), warm[index])):
             for step, lines in found.items():
                 for path, line in map(tuple, lines):
-                    table = masks.setdefault(path, {}).setdefault(line, {})
-                    table[step] = table.get(step, 0) | 1 << index
+                    pair = masks.setdefault(path, {}).setdefault(line, {}).setdefault(step, [0, 0])
+                    pair[slot] |= 1 << index
     return masks
 
 
@@ -288,9 +293,10 @@ def build(out):
     executed = plain["executed"]
     if plain["parent"] != old_baseline["parent"] or plain["reports"]["session_artifacts"] != old_baseline["parent"]:
         raise SystemExit("the parent artifacts of the old baseline are not reproduced")
-    if plain["worker"] != old_baseline["worker"]:
-        differing = sorted(name for name in plain["worker"].keys() | old_baseline["worker"].keys()
-                           if plain["worker"].get(name) != old_baseline["worker"].get(name))
+    recorded = {name: value for name, value in old_baseline["worker"].items() if not name.startswith("plan")}
+    if plain["worker"] != recorded:
+        differing = sorted(name for name in plain["worker"].keys() | recorded.keys()
+                           if plain["worker"].get(name) != recorded.get(name))
         raise SystemExit(f"the worker artifacts of the old baseline are not reproduced: {differing[:8]}")
     extra = {name: value for name, value in planned["worker"].items() if name not in plain["worker"]}
     moved = sorted(name for name, value in plain["worker"].items() if planned["worker"].get(name) != value)
@@ -319,31 +325,38 @@ def build(out):
     plan = {}
     for path, table in masks.items():
         for line, steps in table.items():
-            mask = 0
+            built = 0
             for step in MASKED:
-                mask |= steps.get(step, 0)
-            if mask:
-                merged = int(worker.get(path, {}).get(str(line), "0"), 16) | mask
-                worker.setdefault(path, {})[str(line)] = format(merged, "x")
-            built = steps.get("R", 0) | steps.get("P", 0)
+                cold, warm = steps.get(step, (0, 0))
+                built |= cold | warm
             if built:
+                merged = int(worker.get(path, {}).get(str(line), "0"), 16) | built
+                worker.setdefault(path, {})[str(line)] = format(merged, "x")
                 plan.setdefault(path, {})[str(line)] = format(built, "x")
     lines = {**old_lines, "worker": {path: dict(sorted(table.items(), key=lambda item: int(item[0])))
                                      for path, table in sorted(worker.items())},
              "plan": {path: dict(sorted(table.items(), key=lambda item: int(item[0])))
                       for path, table in sorted(plan.items())}}
 
-    kept, admitted = {}, {}
-    for path, listed in old_consumer["test_execute_tpcds"].items():
+    kept, admitted, first_only = {}, {}, 0
+    outside = {path: set(listed) for path, listed in old_consumer["test_execute_tpcds"].items()}
+    for path, listed in old_consumer.get("admitted", {}).items():
+        outside.setdefault(path, set()).update(listed)
+    for path, listed in sorted(outside.items()):
         early = before_first_task.get(path, ())
-        for line in listed:
-            steps = set(masks.get(path, {}).get(line, ()))
-            if steps and steps <= REPLAYED and line not in early:
-                admitted.setdefault(path, []).append(line)
+        for line in sorted(listed):
+            steps = masks.get(path, {}).get(line, {})
+            if steps and set(steps) <= REPLAYED and line not in early:
+                if any(steps[step][0] & ~steps[step][1] for step in MASKED if step in steps):
+                    first_only += 1
+                    kept.setdefault(path, []).append(line)
+                else:
+                    admitted.setdefault(path, []).append(line)
             else:
                 kept.setdefault(path, []).append(line)
     consumer = {**old_consumer,
-                "boundary": old_consumer["boundary"] + ", sql(pretty=True)<-execute, Plan<-execute",
+                "boundary": old_consumer["boundary"].split(", sql(pretty=True)")[0]
+                + ", sql(pretty=True)<-execute, Plan<-execute",
                 "test_execute_tpcds": {path: sorted(listed) for path, listed in sorted(kept.items())},
                 "admitted": {path: sorted(listed) for path, listed in sorted(admitted.items())}}
     os.makedirs(out, exist_ok=True)
@@ -354,9 +367,10 @@ def build(out):
                       "worker_cpu_recorded": round(sum(planned["reports"]["worker"]["per"].get(str(index), 0.0)
                                                        for index in executed), 3),
                       "stage_cpu": planned["reports"]["worker"]["cpu"],
-                      "consumer_before": sum(len(v) for v in old_consumer["test_execute_tpcds"].values()),
+                      "consumer_before": sum(len(v) for v in outside.values()),
                       "consumer_after": sum(len(v) for v in kept.values()),
                       "admitted_by_file": {path: len(listed) for path, listed in sorted(admitted.items())},
+                      "kept_as_first_task_only": first_only,
                       "plan_mask_lines": sum(len(table) for table in plan.values()),
                       "worker_mask_lines": [sum(len(t) for t in old_lines["worker"].values()),
                                             sum(len(t) for t in worker.values())],
