@@ -227,8 +227,18 @@ def refine_max_nodes(changes, chosen, cov, catalog, deadline=None):
             if path.endswith(".py"):
                 if not path.startswith("sqlglot/") or path.endswith("__main__.py"):
                     return chosen
-                if NODE in cov.file_execution(path) and _adds_threshold(change):
-                    return chosen
+                if NODE in cov.file_execution(path):
+                    from semantics import semantic_lines
+
+
+
+                    sites = semantic_lines(path, change.original, change.patched, change.removed)
+                    if sites is None:
+                        sites = change.removed
+                        if not sites:
+                            return chosen
+                    if NODE in cov.lines(path, sites) or _adds_threshold(change):
+                        return chosen
                 sources[path] = change.patched
             elif NODE in cov.fixture(path):
                 return chosen

@@ -24,7 +24,7 @@ FROM profiler AS selector
 WORKDIR /app
 RUN python -m compileall -q -x '/site-packages/' /usr/local/lib/python3.13 /opt/sqlglot/sqlglot /opt/sqlglot/tests
 COPY selector.py map_store.py patches.py schedule.py semantics.py coverage_map.py source_reader.py typing_keys.py default_profile.py declarations.py import_effects.py value_profile.py identity_profile.py heavy_profile.py replay.py tc_replay.py state_diff.py fixture_flow.py ./
-COPY registry_context.py registry_readers.json ./
+COPY registry_context.py registry_readers.json slice_replay.py ./
 COPY expression_additions.py expression_consumers.json ./
 COPY fe_replay.py fe_fence.py fe_baseline.json.gz fe_consumer.json.gz fe_lines.json.gz ./
 COPY ds_verify.py ds_operations.py ds_origin.py ds_worker.py ds_sites.json.gz ./

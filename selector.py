@@ -30,7 +30,8 @@ from tc_replay import refine_tc
 from value_profile import refine
 from source_reader import refine_source_reader
 from typing_keys import refine_typing_schedule
-from fork_check import check_run
+from slice_replay import slice_unchanged
+from fork_check import check_run, verification_catalog
 from import_state import PatchState, narrow, settled_consumers
 from mn_reduced import refine_max_nodes
 from inert_files import inert_change, safe_headers
@@ -82,6 +83,7 @@ def main():
     tests = json.loads((data / "tests.json").read_bytes())["tests"]
     numbers = {test["id"]: test["number"] for test in tests}
     millis = {test["number"]: round(1000 * test["seconds"]) for test in tests}
+    verify_numbers, verify_millis = verification_catalog(numbers, millis)
     catalog = set(numbers)
     seconds = {test["id"]: test["seconds"] for test in tests}
     tests_by_file = {}
@@ -98,6 +100,9 @@ def main():
         try:
             text = patch.read_text(encoding="utf-8")
             changes = read_changes(text, source)
+            if slice_unchanged(changes, text, cov, catalog):
+                print(json.dumps({"commit": patch.stem, "workers": []}, separators=(",", ":")))
+                continue
             state = PatchState(changes, source, verify_until, seconds)
             proof_context = changes if time.monotonic() < verify_until else None
             ordered = any(order_sensitive_change(c, proof_context) or expression_contract_narrowed(c, state)
@@ -134,7 +139,7 @@ def main():
                                                padding.full_cost if padding is not None else None)
             chosen.update(unseen)
             if not ordered:
-                chosen = check_run(changes, chosen, cov, numbers, millis, verify_until, patch)
+                chosen = check_run(changes, chosen, cov, verify_numbers, verify_millis, verify_until, patch)
         except (SyntaxError, ValueError, IndexError, KeyError, OSError, RecursionError) as exc:
             print(f"{patch.name}: using full suite ({type(exc).__name__})", file=sys.stderr)
             chosen = catalog

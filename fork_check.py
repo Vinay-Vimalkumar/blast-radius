@@ -242,6 +242,12 @@ _client = _Client()
 _order = {}
 
 
+def verification_catalog(numbers, millis):
+    ranks = {node: position for position, node in enumerate(sorted(numbers))}
+    durations = {position: millis[numbers[node]] for node, position in ranks.items()}
+    return ranks, durations
+
+
 def check_run(changes, chosen, cov, numbers, millis, verify_until, patch=None):
     began = time.monotonic()
     try:
