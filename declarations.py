@@ -302,6 +302,67 @@ def _observed(rows, cov, relevant=None):
     return found
 
 
+def _registry_filter(tree, module, source, line):
+    for owner, attr, stmt in _declarations(tree, module):
+        if (attr not in {"FUNCTIONS", "PROPERTY_PARSERS"} or not isinstance(stmt.value, ast.Dict)
+                or not stmt.lineno <= line <= stmt.end_lineno):
+            continue
+        for key, item in zip(stmt.value.keys, stmt.value.values):
+            if key is not None or not isinstance(item, ast.DictComp) or len(item.generators) != 1:
+                continue
+            gen = item.generators[0]
+            if (gen.is_async or len(gen.ifs) != 1 or not isinstance(gen.target, ast.Tuple)
+                    or len(gen.target.elts) != 2 or not all(isinstance(n, ast.Name) for n in gen.target.elts)
+                    or not isinstance(item.key, ast.Name) or not isinstance(item.value, ast.Name)
+                    or [n.id for n in gen.target.elts] != [item.key.id, item.value.id]
+                    or not isinstance(gen.iter, ast.Call) or gen.iter.args or gen.iter.keywords
+                    or ast.unparse(gen.iter.func) != f"parser.Parser.{attr}.items"):
+                continue
+            pred = gen.ifs[0]
+            if (isinstance(pred, ast.Compare) and pred.lineno <= line <= pred.end_lineno
+                    and len(pred.ops) == 1 and isinstance(pred.ops[0], (ast.Eq, ast.NotEq))
+                    and isinstance(pred.left, ast.Name) and pred.left.id == item.key.id
+                    and isinstance(pred.comparators[0], ast.Constant) and type(pred.comparators[0].value) is str):
+                return owner, attr, _outside_dict(source, pred)
+    return None
+
+
+def filter_registry_readers(change, bindings, candidates):
+    if (not change.path.startswith("sqlglot/parsers/") or len(change.removed) != 1
+            or len(change.added) != 1 or not bindings
+            or not all(k.endswith((".FUNCTIONS", ".PROPERTY_PARSERS")) for k in bindings)):
+        return candidates
+    module = change.path[:-3].replace("/", ".")
+    old, new = _declaration_trees(change.path, change.original, change.patched)
+    match = _registry_filter(old, module, change.original, next(iter(change.removed)))
+    if match is None or match != _registry_filter(new, module, change.patched, next(iter(change.added))):
+        return candidates
+    owner, attr, _ = match
+    descendants, _, _, _, copies = _index()
+    impacted = set(descendants.get(owner, ()))
+    pending = list(impacted)
+    while pending:
+        for copied in copies.get((pending.pop(), attr), ()):
+            extra = descendants[copied] - impacted
+            impacted.update(extra)
+            pending.extend(extra)
+    affected = {cls + "." + attr for cls in impacted}
+    if owner + "." + attr not in bindings or not set(bindings) <= affected:
+        return candidates
+    tests, records, aliases, _ = _lookup_index()
+    for path in bindings:
+        key = (path.rsplit(".", 1)[0], attr)
+        origin = aliases.get(key, key)
+        if (*origin, "@") not in records:
+            return candidates
+    retained = set(candidates).difference(tests)
+    retained.update(expression_consumer_profile()["opaque"])
+    for cls in impacted:
+        origin = aliases.get((cls, attr), (cls, attr))
+        retained.update(tests[i] for i in records.get((*origin, "@"), ()))
+    return candidates & retained
+
+
 def _lookup_candidates(cls, attr, impacted, keys, shape, module, cov):
     tests, records, aliases, access = _lookup_index()
     origins = [aliases.get((owner, attr), (owner, attr)) for owner in impacted]

@@ -890,6 +890,9 @@ def narrow(change, fallback, state, cov, catalog, tests_by_file):
 
                 return fallback
             narrowed |= readers
+        if len(state.changes) == 1:
+            from declarations import filter_registry_readers
+            narrowed = filter_registry_readers(change, changed, narrowed)
         result = (narrowed | keep) & set(fallback)
 
         return result

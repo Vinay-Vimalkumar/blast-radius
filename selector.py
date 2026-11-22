@@ -1,4 +1,16 @@
 if __name__ == "__main__":
+    import os
+
+    if os.environ.get("BR_SELECTOR_ROLE") != "worker":
+
+
+        try:
+            import guard
+
+            guard.supervise(os.path.abspath(__file__))
+        except Exception:
+            pass
+
 
 
     import gc
@@ -92,10 +104,15 @@ def main():
     cov = Coverage()
     unseen = catalog.difference(cov.nodes)
     patches = sorted((data / "commits").glob("*.patch"))
+
+
+    answered = set(json.loads(os.environ.get("BR_SELECTOR_SKIP", "[]")))
+    patches = [patch for patch in patches if patch.stem not in answered]
+    budget = min(85.0, float(os.environ.get("BR_SELECTOR_BUDGET", "85")))
     catalog_bytes = sum(len(str(number)) + 1 for number in millis)
     max_output = sum(len(json.dumps(p.stem)) + catalog_bytes + 50 for p in patches)
     padding = SpareCapacity(millis) if max_output <= 2_000_000 else None
-    verify_until = time.monotonic() + 85
+    verify_until = time.monotonic() + budget
     for patch in patches:
         try:
             text = patch.read_text(encoding="utf-8")
@@ -140,14 +157,19 @@ def main():
             chosen.update(unseen)
             if not ordered:
                 chosen = check_run(changes, chosen, cov, verify_numbers, verify_millis, verify_until, patch)
-        except (SyntaxError, ValueError, IndexError, KeyError, OSError, RecursionError) as exc:
+        except Exception as exc:
+
             print(f"{patch.name}: using full suite ({type(exc).__name__})", file=sys.stderr)
             chosen = catalog
             changes = ()
-        workers = distribute((numbers[node] for node in chosen & catalog), millis)
-        if padding is not None:
-            workers = padding.fill(workers)
-        workers = refine_typing_schedule(changes, workers, cov, tests, millis, padding)
+        try:
+            workers = distribute((numbers[node] for node in chosen & catalog), millis)
+            if padding is not None:
+                workers = padding.fill(workers)
+            workers = refine_typing_schedule(changes, workers, cov, tests, millis, padding)
+        except Exception as exc:
+            print(f"{patch.name}: scheduling the full suite ({type(exc).__name__})", file=sys.stderr)
+            workers = distribute(millis, millis)
         print(json.dumps({"commit": patch.stem, "workers": workers}, separators=(",", ":")))
 
 

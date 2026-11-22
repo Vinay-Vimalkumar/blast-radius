@@ -7,7 +7,7 @@ RUN python -c "import urllib.request; urllib.request.urlretrieve('https://codelo
 ENV PYTHONPATH=/opt/sqlglot SKIP_INTEGRATION=0 PYTHONDONTWRITEBYTECODE=1
 
 FROM source AS profiler
-RUN pip install --no-cache-dir pytest==9.2.0 pytest-timeout==2.4.0 duckdb==2.0.0 numpy==2.5.5 pandas==3.1.1 python-dateutil==4.0.0 pytz==2026.6 typing_extensions==4.16.0 psutil==7.2.2 setuptools==84.2.1 setuptools-scm==10.3.4
+RUN pip install --no-cache-dir pytest==9.2.0 pytest-timeout==2.4.0 duckdb==2.0.0 numpy==2.5.5 pandas==3.1.1 python-dateutil==4.0.0 pytz==2026.6 typing_extensions==4.16.0 psutil==7.2.2 setuptools==84.2.1 setuptools-scm==10.3.4 iniconfig==2.3.1 packaging==26.3 pluggy==1.7.0 Pygments==2.21.0 tzdata==2026.6 vcs-versioning==2.6.0
 WORKDIR /app
 
 FROM source AS native
@@ -24,7 +24,7 @@ FROM profiler AS selector
 WORKDIR /app
 RUN python -m compileall -q -x '/site-packages/' /usr/local/lib/python3.13 /opt/sqlglot/sqlglot /opt/sqlglot/tests
 COPY selector.py map_store.py patches.py schedule.py semantics.py coverage_map.py source_reader.py typing_keys.py default_profile.py declarations.py import_effects.py value_profile.py identity_profile.py heavy_profile.py replay.py tc_replay.py state_diff.py fixture_flow.py ./
-COPY registry_context.py registry_readers.json slice_replay.py ./
+COPY registry_context.py registry_readers.json slice_replay.py guard.py ./
 COPY expression_additions.py expression_consumers.json ./
 COPY fe_replay.py fe_fence.py fe_baseline.json.gz fe_consumer.json.gz fe_lines.json.gz ./
 COPY ds_verify.py ds_operations.py ds_origin.py ds_worker.py ds_sites.json.gz ./
