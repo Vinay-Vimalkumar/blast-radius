@@ -857,6 +857,9 @@ def binding_readers(path, cov, catalog, tests_by_file):
                 found |= tests_by_file.get(file, set())
         if runtime:
             found |= cov.lines(file, runtime)
+
+
+            found |= _after_import(file, runtime, cov, catalog, tests_by_file)
     return found
 
 
