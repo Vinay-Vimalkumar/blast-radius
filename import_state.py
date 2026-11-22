@@ -887,15 +887,27 @@ def narrow(change, fallback, state, cov, catalog, tests_by_file):
         if changed is None:
             return fallback
         narrowed = set()
+        named = False
         for path in changed:
             readers = binding_readers(path, cov, catalog, tests_by_file)
             if readers is None:
 
                 return fallback
+
+            named = named or (bool(readers) and not path.startswith(("code:", "fn:")))
             narrowed |= readers
         if len(state.changes) == 1:
             from declarations import filter_registry_readers
-            narrowed = filter_registry_readers(change, changed, narrowed)
+            filtered = filter_registry_readers(change, changed, narrowed)
+            if filtered is not narrowed:
+
+                return (filtered | keep) & set(fallback)
+        if named:
+
+
+
+
+            return fallback
         result = (narrowed | keep) & set(fallback)
 
         return result
